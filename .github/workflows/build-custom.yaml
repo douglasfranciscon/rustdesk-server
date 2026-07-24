@@ -21,6 +21,9 @@ env:
   CARGO_TERM_COLOR: always
   TARGET: x86_64-unknown-linux-musl
   IMAGE: ghcr.io/${{ github.repository_owner }}/rustdesk-server-custom
+  # sqlx query! valida contra o db_v2.sqlite3 versionado em tempo de compilação
+  # (antes vinha do .env, que saiu do versionamento por conter segredos)
+  DATABASE_URL: sqlite://./db_v2.sqlite3
 
 jobs:
   build-and-push:

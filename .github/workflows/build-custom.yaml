@@ -1,0 +1,92 @@
+# Workflow enxuto do fork: compila hbbs/hbbr (amd64) e publica a imagem
+# Docker S6 (hbbs+hbbr num container só) no GHCR do próprio repositório.
+# Sem secrets adicionais.
+#
+# Dispara ao criar uma tag de versão (ex: 1.1.17-br1) ou manualmente.
+# Imagem resultante: ghcr.io/<owner>/rustdesk-server-custom:<tag>
+name: build-custom
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+-br[0-9]+'
+      - 'v[0-9]+.[0-9]+.[0-9]+-br[0-9]+'
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+  IMAGE: ghcr.io/${{ github.repository_owner }}/rustdesk-server-custom
+
+jobs:
+  build-and-push:
+    name: Build binaries + Docker image (amd64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+
+      - name: Install musl tools
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --target=${{ env.TARGET }}
+
+      - name: Stage binaries for Docker (s6 image)
+        run: |
+          cp -v target/${{ env.TARGET }}/release/hbbs docker/rootfs/usr/bin/
+          cp -v target/${{ env.TARGET }}/release/hbbr docker/rootfs/usr/bin/
+          cp -v target/${{ env.TARGET }}/release/rustdesk-utils docker/rootfs/usr/bin/
+          chmod -v a+x docker/rootfs/usr/bin/*
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: vars
+        run: |
+          T=${GITHUB_REF#refs/*/}
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then T=dev-$(git rev-parse --short HEAD); fi
+          echo "GIT_TAG=$T" >> $GITHUB_ENV
+
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: ./docker
+          platforms: linux/amd64
+          push: true
+          provenance: false
+          build-args: |
+            S6_ARCH=x86_64
+          tags: |
+            ${{ env.IMAGE }}:${{ env.GIT_TAG }}
+            ${{ env.IMAGE }}:latest
+
+      - name: Publish binaries as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-linux-amd64
+          path: |
+            target/${{ env.TARGET }}/release/hbbs
+            target/${{ env.TARGET }}/release/hbbr
+            target/${{ env.TARGET }}/release/rustdesk-utils
+          if-no-files-found: error

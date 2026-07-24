@@ -1,3 +1,5 @@
+FROM alpine:3 AS certs
+
 FROM busybox:stable
 
 ARG S6_OVERLAY_VERSION=3.2.0.0
@@ -9,6 +11,9 @@ RUN \
   tar -C / -Jxpf /tmp/s6-overlay-${S6_ARCH}.tar.xz && \
   rm /tmp/s6-overlay*.tar.xz && \
   ln -s /run /var/run
+
+# CA certificates so hbbs can reach CONTROL_API_URL over https
+COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
 
 COPY rootfs /
 

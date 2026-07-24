@@ -336,6 +336,8 @@ impl RendezvousServer {
                     // B registered
                     if !rp.id.is_empty() {
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
+                        crate::control_api::report_seen(&rp.id, try_into_v4(addr).ip().to_string())
+                            .await;
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
                             let mut msg_out = RendezvousMessage::new();
@@ -423,6 +425,7 @@ impl RendezvousServer {
                             );
                         }
                     }
+                    crate::control_api::report_seen(&id, ip.clone()).await;
                     if changed {
                         self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
                     }
@@ -503,6 +506,21 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                    }
+                    if crate::control_api::is_enabled() {
+                        let from_ip = try_into_v4(addr).ip().to_string();
+                        if let Err(reason) =
+                            crate::control_api::check_token(&rf.token, &from_ip).await
+                        {
+                            crate::control_api::record_block(&from_ip, &rf.id, &reason).await;
+                            let mut msg_out = RendezvousMessage::new();
+                            msg_out.set_relay_response(RelayResponse {
+                                refuse_reason: reason,
+                                ..Default::default()
+                            });
+                            allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
+                            return true;
+                        }
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -696,6 +714,30 @@ impl RendezvousServer {
                 ..Default::default()
             });
             return Ok((msg_out, None));
+        }
+        if crate::control_api::is_enabled() {
+            let from_ip = try_into_v4(addr).ip().to_string();
+            match crate::control_api::check_token(&ph.token, &from_ip).await {
+                Ok(user) => {
+                    if let Some(user) = user {
+                        log::info!(
+                            "BR_SUPORTE: punch hole de {} ({}) para {} autorizado",
+                            from_ip,
+                            user,
+                            ph.id
+                        );
+                    }
+                }
+                Err(reason) => {
+                    crate::control_api::record_block(&from_ip, &ph.id, &reason).await;
+                    let mut msg_out = RendezvousMessage::new();
+                    msg_out.set_punch_hole_response(PunchHoleResponse {
+                        other_failure: reason,
+                        ..Default::default()
+                    });
+                    return Ok((msg_out, None));
+                }
+            }
         }
         let id = ph.id;
         // punch hole request from A, relay to B,
@@ -1065,6 +1107,9 @@ impl RendezvousServer {
                         let _ = writeln!(res, "{} {} -> {}@{}", event_iso, e.from_ip, e.to_id, e.to_ip);
                     }
                 }
+            }
+            Some("control-api" | "ca") => {
+                res = crate::control_api::diag().await;
             }
             Some("always-use-relay" | "aur") => {
                 if let Some(rs) = fds.next() {

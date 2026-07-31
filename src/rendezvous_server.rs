@@ -558,13 +558,35 @@ impl RendezvousServer {
                     }
                     if crate::control_api::is_enabled() {
                         let from_ip = try_into_v4(addr).ip().to_string();
-                        if let Err(reason) =
-                            crate::control_api::check_token(&rf.token, &from_ip).await
-                        {
-                            crate::control_api::record_block(&from_ip, &rf.id, &reason).await;
+                        let conn_type = format!("{:?}", rf.conn_type.enum_value_or_default());
+                        let via = if ws { "ws" } else { "tcp" };
+                        let outcome = crate::control_api::check_token(&rf.token, &from_ip).await;
+                        let (result, reason) = match &outcome {
+                            Ok(_) => ("allowed", None),
+                            Err(denial) => (denial.code(), Some(denial.message())),
+                        };
+                        let user = outcome.as_ref().ok().and_then(|u| u.as_deref());
+                        // auditoria: nunca bloqueia nem atrasa a conexão. Normalmente
+                        // cai no dedupe do punch hole que veio antes.
+                        crate::control_api::report_attempt(crate::control_api::Attempt {
+                            kind: "relay",
+                            target_id: &rf.id,
+                            from_ip: &from_ip,
+                            token: &rf.token,
+                            user,
+                            result,
+                            reason,
+                            conn_type: &conn_type,
+                            version: None,
+                            via,
+                        })
+                        .await;
+                        if let Err(denial) = outcome {
+                            crate::control_api::record_block(&from_ip, &rf.id, denial.message())
+                                .await;
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_relay_response(RelayResponse {
-                                refuse_reason: reason,
+                                refuse_reason: denial.message().to_owned(),
                                 ..Default::default()
                             });
                             allow_err!(self.send_to_tcp_sync(msg_out, addr).await);
@@ -867,7 +889,29 @@ impl RendezvousServer {
         }
         if crate::control_api::is_enabled() {
             let from_ip = try_into_v4(addr).ip().to_string();
-            match crate::control_api::check_token(&ph.token, &from_ip).await {
+            let conn_type = format!("{:?}", ph.conn_type.enum_value_or_default());
+            let via = if ws { "ws" } else { "tcp" };
+            let outcome = crate::control_api::check_token(&ph.token, &from_ip).await;
+            let (result, reason) = match &outcome {
+                Ok(_) => ("allowed", None),
+                Err(denial) => (denial.code(), Some(denial.message())),
+            };
+            let user = outcome.as_ref().ok().and_then(|u| u.as_deref());
+            // auditoria: nunca bloqueia nem atrasa a conexão
+            crate::control_api::report_attempt(crate::control_api::Attempt {
+                kind: "punch_hole",
+                target_id: &ph.id,
+                from_ip: &from_ip,
+                token: &ph.token,
+                user,
+                result,
+                reason,
+                conn_type: &conn_type,
+                version: Some(&ph.version),
+                via,
+            })
+            .await;
+            match outcome {
                 Ok(user) => {
                     if let Some(user) = user {
                         log::info!(
@@ -878,11 +922,11 @@ impl RendezvousServer {
                         );
                     }
                 }
-                Err(reason) => {
-                    crate::control_api::record_block(&from_ip, &ph.id, &reason).await;
+                Err(denial) => {
+                    crate::control_api::record_block(&from_ip, &ph.id, denial.message()).await;
                     let mut msg_out = RendezvousMessage::new();
                     msg_out.set_punch_hole_response(PunchHoleResponse {
-                        other_failure: reason,
+                        other_failure: denial.message().to_owned(),
                         ..Default::default()
                     });
                     return Ok((msg_out, None));

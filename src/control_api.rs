@@ -19,6 +19,8 @@ struct Config {
     timeout_ms: u64,
     cache_secs: u64,
     seen_secs: u64,
+    attempts: bool,
+    attempt_dedupe_secs: u64,
 }
 
 static CONFIG: Lazy<Config> = Lazy::new(|| {
@@ -35,17 +37,25 @@ static CONFIG: Lazy<Config> = Lazy::new(|| {
         seen_secs: get_arg_or("control_api_seen_secs", "300".to_owned())
             .parse()
             .unwrap_or(300),
+        // ligado por default: o POST é fire-and-forget, então subir o hbbs antes
+        // de a API ter a rota só gera warning de 404
+        attempts: get_arg_or("control_api_attempts", "Y".to_owned()).to_uppercase() != "N",
+        attempt_dedupe_secs: get_arg_or("control_api_attempt_dedupe_secs", "60".to_owned())
+            .parse()
+            .unwrap_or(60),
     };
     if config.url.is_empty() {
         log::info!("BR_SUPORTE: CONTROL_API_URL vazio, feature DESLIGADA (comportamento vanilla)");
     } else {
         log::info!(
-            "BR_SUPORTE: LIGADO url={} fail_open={} timeout_ms={} cache_secs={} seen_secs={} auth_bearer={}",
+            "BR_SUPORTE: LIGADO url={} fail_open={} timeout_ms={} cache_secs={} seen_secs={} attempts={} attempt_dedupe_secs={} auth_bearer={}",
             config.url,
             config.fail_open,
             config.timeout_ms,
             config.cache_secs,
             config.seen_secs,
+            config.attempts,
+            config.attempt_dedupe_secs,
             !config.token.is_empty()
         );
     }
@@ -78,8 +88,36 @@ struct BlockEntry {
     reason: String,
 }
 
+/// Why a connection attempt was refused. `message()` is what the client shows,
+/// `code()` is what goes to the API audit event.
+#[derive(Clone, Copy)]
+pub enum Denial {
+    LoginRequired,
+    NotAuthorized,
+    ApiDown,
+}
+
+impl Denial {
+    pub fn message(&self) -> &'static str {
+        match self {
+            Denial::LoginRequired => MSG_LOGIN_REQUIRED,
+            Denial::NotAuthorized => MSG_DENIED,
+            Denial::ApiDown => MSG_API_DOWN,
+        }
+    }
+
+    pub fn code(&self) -> &'static str {
+        match self {
+            Denial::LoginRequired => "login_required",
+            Denial::NotAuthorized => "denied",
+            Denial::ApiDown => "api_down",
+        }
+    }
+}
+
 static TOKEN_CACHE: Lazy<Mutex<HashMap<String, TokenEntry>>> = Lazy::new(Default::default);
 static SEEN_SENT: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(Default::default);
+static ATTEMPT_SENT: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(Default::default);
 static BLOCKS: Lazy<Mutex<Vec<BlockEntry>>> = Lazy::new(Default::default);
 
 #[inline]
@@ -88,16 +126,15 @@ pub fn is_enabled() -> bool {
 }
 
 /// Checks whether the given client token belongs to an authorized controller.
-/// Returns Ok(user name if reported by the API) to allow, Err(user-facing
-/// message) to deny.
-pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, String> {
+/// Returns Ok(user name if reported by the API) to allow, Err(denial) to deny.
+pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, Denial> {
     if !is_enabled() {
         return Ok(None);
     }
     if token.is_empty() {
         // TODO(debug-teste): logs verbosos desta fase de teste; remover depois
         log::info!("BR_SUPORTE: check_token ip={} token VAZIO -> bloqueado (login necessário)", ip);
-        return Err(MSG_LOGIN_REQUIRED.to_owned());
+        return Err(Denial::LoginRequired);
     }
     let token_prefix: String = token.chars().take(8).collect();
     let now = Instant::now();
@@ -115,7 +152,7 @@ pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, String
                 return if entry.authorized {
                     Ok(entry.user.clone())
                 } else {
-                    Err(MSG_DENIED.to_owned())
+                    Err(Denial::NotAuthorized)
                 };
             }
         }
@@ -151,7 +188,7 @@ pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, String
             if authorized {
                 Ok(user)
             } else {
-                Err(MSG_DENIED.to_owned())
+                Err(Denial::NotAuthorized)
             }
         }
         Err(err) => {
@@ -164,7 +201,7 @@ pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, String
             if CONFIG.fail_open {
                 Ok(None)
             } else {
-                Err(MSG_API_DOWN.to_owned())
+                Err(Denial::ApiDown)
             }
         }
     }
@@ -258,6 +295,113 @@ pub async fn report_seen(id: &str, ip: String) {
     });
 }
 
+/// One connection attempt, as reported to the API audit endpoint.
+pub struct Attempt<'a> {
+    /// "punch_hole" or "relay"
+    pub kind: &'a str,
+    /// RustDesk id of the machine being connected to
+    pub target_id: &'a str,
+    pub from_ip: &'a str,
+    /// controller session token, empty when the client was not logged in
+    pub token: &'a str,
+    /// user name as reported by /tokens/verify, when known
+    pub user: Option<&'a str>,
+    /// "allowed" or Denial::code()
+    pub result: &'a str,
+    /// user-facing refusal message, None when allowed
+    pub reason: Option<&'a str>,
+    /// ConnType enum name (DEFAULT_CONN, FILE_TRANSFER, ...)
+    pub conn_type: &'a str,
+    /// client version, only known on punch hole requests
+    pub version: Option<&'a str>,
+    /// "tcp" or "ws"
+    pub via: &'a str,
+}
+
+/// Reports a connection attempt (allowed or blocked) to the control API.
+///
+/// Audit only: this NEVER blocks, delays or changes a connection. The request
+/// runs in a detached task and every failure (timeout, 404, API down, no http
+/// client) ends in a log line. Deduplicated by (ip, target, result) for
+/// CONTROL_API_ATTEMPT_DEDUPE_SECS, because clients retry the punch hole
+/// request several times and then ask for a relay for the same connection.
+pub async fn report_attempt(a: Attempt<'_>) {
+    if !is_enabled() || !CONFIG.attempts || a.target_id.is_empty() {
+        return;
+    }
+    let now = Instant::now();
+    let key = format!("{}|{}|{}", a.from_ip, a.target_id, a.result);
+    {
+        let mut sent = ATTEMPT_SENT.lock().await;
+        if let Some(tm) = sent.get(&key) {
+            if now.duration_since(*tm).as_secs() < CONFIG.attempt_dedupe_secs {
+                log::debug!(
+                    "BR_SUPORTE: connections/attempt {} suprimido pelo dedupe ({}s restantes)",
+                    key,
+                    CONFIG
+                        .attempt_dedupe_secs
+                        .saturating_sub(now.duration_since(*tm).as_secs())
+                );
+                return;
+            }
+        }
+        if sent.len() >= MAX_CACHE_ENTRIES && !sent.contains_key(&key) {
+            let ttl = CONFIG.attempt_dedupe_secs;
+            sent.retain(|_, tm| now.duration_since(*tm).as_secs() < ttl);
+        }
+        sent.insert(key.clone(), now);
+    }
+    let body = serde_json::json!({
+        "target_id": a.target_id,
+        "ip": a.from_ip,
+        "token": a.token,
+        "user": a.user,
+        "result": a.result,
+        "reason": a.reason,
+        "kind": a.kind,
+        "conn_type": a.conn_type,
+        "version": a.version,
+        "via": a.via,
+        "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+    });
+    log::info!(
+        "BR_SUPORTE: connections/attempt enviando {} kind={} user={:?}",
+        key,
+        a.kind,
+        a.user
+    );
+    tokio::spawn(async move {
+        if let Some(client) = HTTP.as_ref() {
+            let mut req = client
+                .post(format!("{}/connections/attempt", CONFIG.url))
+                .json(&body);
+            if !CONFIG.token.is_empty() {
+                req = req.bearer_auth(&CONFIG.token);
+            }
+            let started = Instant::now();
+            match req.send().await {
+                Ok(resp) => {
+                    if resp.status().is_success() {
+                        log::info!(
+                            "BR_SUPORTE: connections/attempt {} -> HTTP {} em {}ms",
+                            key,
+                            resp.status().as_u16(),
+                            started.elapsed().as_millis()
+                        );
+                    } else {
+                        log::warn!(
+                            "BR_SUPORTE: connections/attempt {} returned {}",
+                            key,
+                            resp.status()
+                        );
+                    }
+                }
+                Err(err) => log::warn!("BR_SUPORTE: connections/attempt {} failed: {}", key, err),
+            }
+        }
+    });
+}
+
 /// Records a blocked connection attempt for the local console diagnostics.
 pub async fn record_block(from_ip: &str, target_id: &str, reason: &str) {
     log::warn!(
@@ -293,6 +437,11 @@ pub async fn diag() -> String {
         "timeout_ms: {} cache_secs: {} seen_secs: {}",
         CONFIG.timeout_ms, CONFIG.cache_secs, CONFIG.seen_secs
     );
+    let _ = writeln!(
+        res,
+        "attempts: {} attempt_dedupe_secs: {}",
+        CONFIG.attempts, CONFIG.attempt_dedupe_secs
+    );
     {
         let cache = TOKEN_CACHE.lock().await;
         let _ = writeln!(res, "token cache: {} entries", cache.len());
@@ -311,6 +460,10 @@ pub async fn diag() -> String {
     {
         let seen = SEEN_SENT.lock().await;
         let _ = writeln!(res, "seen throttle: {} ids", seen.len());
+    }
+    {
+        let attempts = ATTEMPT_SENT.lock().await;
+        let _ = writeln!(res, "attempt dedupe: {} chaves", attempts.len());
     }
     {
         let blocks = BLOCKS.lock().await;

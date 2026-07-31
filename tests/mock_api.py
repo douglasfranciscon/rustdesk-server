@@ -1,15 +1,16 @@
 """Mock da API de controle para testar o hbbs customizado.
 
 Endpoints do contrato:
-  POST /tokens/verify  {"token": "...", "ip": "..."} -> 200 {"user": "..."} | 403
-  POST /peers/seen     {"id": "...", "ip": "..."}    -> 200
-  POST /api/login      -> devolve access_token fixo "tok-aprovado"
+  POST /tokens/verify        {"token": "...", "ip": "..."} -> 200 {"user": "..."} | 403
+  POST /peers/seen           {"id": "...", "ip": "..."}    -> 200
+  POST /connections/attempt  {"target_id": ..., "result": ...} -> 200 (auditoria)
+  POST /api/login            -> devolve access_token fixo "tok-aprovado"
   POST /api/currentUser, /api/logout, /api/heartbeat, /api/sysinfo -> 200 {}
 
 Endpoints de teste (controle do mock em runtime):
   GET /_approve?token=X  -> adiciona X aos aprovados
   GET /_revoke?token=X   -> remove X dos aprovados
-  GET /_state            -> mostra aprovados e peers vistos
+  GET /_state            -> mostra aprovados, peers vistos e tentativas
 
 Uso: python mock_api.py [porta]  (default 21120)
 """
@@ -21,6 +22,8 @@ from urllib.parse import urlparse, parse_qs
 
 APPROVED = {"tok-aprovado"}
 PEERS_SEEN = {}
+ATTEMPTS = []
+MAX_ATTEMPTS = 200
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -54,7 +57,11 @@ class Handler(BaseHTTPRequestHandler):
             APPROVED.discard(token)
             self._send(200, {"approved": sorted(APPROVED)})
         elif url.path == "/_state":
-            self._send(200, {"approved": sorted(APPROVED), "peers_seen": PEERS_SEEN})
+            self._send(200, {
+                "approved": sorted(APPROVED),
+                "peers_seen": PEERS_SEEN,
+                "attempts": ATTEMPTS,
+            })
         else:
             self._send(404)
 
@@ -74,6 +81,15 @@ class Handler(BaseHTTPRequestHandler):
             pid = body.get("id", "")
             PEERS_SEEN[pid] = {"ip": body.get("ip", ""), "last_seen": datetime.now().isoformat()}
             print(f"  peer visto id={pid} ip={body.get('ip')}")
+            self._send(200)
+        elif url.path == "/connections/attempt":
+            if len(ATTEMPTS) >= MAX_ATTEMPTS:
+                del ATTEMPTS[0]
+            ATTEMPTS.append(body)
+            print(
+                f"  tentativa {body.get('result')} kind={body.get('kind')}"
+                f" alvo={body.get('target_id')} ip={body.get('ip')} user={body.get('user')}"
+            )
             self._send(200)
         elif url.path == "/api/login":
             print(f"  login de {body.get('username')!r} id={body.get('id')} uuid={body.get('uuid')}")

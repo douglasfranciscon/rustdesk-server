@@ -64,6 +64,31 @@ fn spawn_hbbs(port: u16, api_url: Option<&str>) -> Guard {
     guard
 }
 
+/// Raw HTTP/1.0 GET of the mock's /_state (the test crate has no http client).
+fn mock_state(port: u16) -> String {
+    use std::io::{Read as _, Write as _};
+    let mut stream =
+        std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to mock api");
+    stream
+        .write_all(b"GET /_state HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
+        .expect("send /_state request");
+    let mut body = String::new();
+    stream.read_to_string(&mut body).expect("read /_state");
+    body
+}
+
+/// The attempt events are posted from a detached task, so poll for them.
+fn wait_for_attempt(port: u16, needle: &str) -> String {
+    for _ in 0..40 {
+        let state = mock_state(port);
+        if state.contains(needle) {
+            return state;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    panic!("attempt {needle} never reached the mock api:\n{}", mock_state(port));
+}
+
 async fn connect(port: u16) -> FramedStream {
     FramedStream::new(format!("127.0.0.1:{port}"), None, 3000)
         .await
@@ -71,10 +96,14 @@ async fn connect(port: u16) -> FramedStream {
 }
 
 async fn punch(port: u16, token: &str) -> PunchHoleResponse {
+    punch_to(port, token, TARGET_ID).await
+}
+
+async fn punch_to(port: u16, token: &str, target: &str) -> PunchHoleResponse {
     let mut stream = connect(port).await;
     let mut msg = RendezvousMessage::new();
     msg.set_punch_hole_request(PunchHoleRequest {
-        id: TARGET_ID.to_owned(),
+        id: target.to_owned(),
         token: token.to_owned(),
         ..Default::default()
     });
@@ -151,12 +180,68 @@ async fn gate_blocks_and_allows_by_token() {
     let rr = request_relay(41116, "tok-aprovado").await;
     assert!(rr.is_none(), "approved relay must not be refused: {rr:?}");
 
+    // Toda tentativa acima virou evento de auditoria na API, com o desfecho.
+    let state = wait_for_attempt(41999, r#""result": "allowed""#);
+    assert!(
+        state.contains(r#""result": "login_required""#),
+        "expected a login_required attempt event: {state}"
+    );
+    assert!(
+        state.contains(r#""result": "denied""#),
+        "expected a denied attempt event: {state}"
+    );
+    assert!(
+        state.contains(&format!(r#""target_id": "{TARGET_ID}""#)),
+        "attempt events must carry the target id: {state}"
+    );
+    assert!(
+        state.contains(r#""kind": "punch_hole""#),
+        "expected punch_hole events: {state}"
+    );
+    // Os RequestRelay acima repetem (ip, alvo, desfecho) dos punch holes, então
+    // o dedupe os suprime: 1 evento por conexão, não um por pacote.
+    assert!(
+        !state.contains(r#""kind": "relay""#),
+        "relay attempts duplicating a punch hole must be deduped: {state}"
+    );
+
     // API fora do ar + token não cacheado: fail-closed (default) bloqueia.
     drop(mock);
     let resp = punch(41116, "tok-novo-sem-cache").await;
     assert!(
         resp.other_failure.contains("indisponível"),
         "expected fail-closed message, got: {resp:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn attempt_post_failure_does_not_block() {
+    let mock = spawn_mock(43999);
+    let _hbbs = spawn_hbbs(43116, Some("http://127.0.0.1:43999"));
+
+    // Primeiro punch coloca o token no cache do hbbs (60s).
+    let resp = punch(43116, "tok-aprovado").await;
+    assert!(resp.other_failure.is_empty(), "gate should not block: {resp:?}");
+
+    // API some. O token segue valendo pelo cache, mas o POST de auditoria vai
+    // falhar — e isso não pode alterar em nada a resposta da conexão. Alvo
+    // diferente para não cair no dedupe e garantir que o POST é tentado.
+    drop(mock);
+    let started = std::time::Instant::now();
+    let resp = punch_to(43116, "tok-aprovado", "111222333").await;
+    assert!(
+        resp.other_failure.is_empty(),
+        "a failing audit post must not refuse the connection: {resp:?}"
+    );
+    assert_eq!(
+        resp.failure.enum_value_or_default(),
+        punch_hole_response::Failure::ID_NOT_EXIST,
+        "expected the normal ID_NOT_EXIST: {resp:?}"
+    );
+    assert!(
+        started.elapsed() < Duration::from_millis(1500),
+        "the audit post must not be awaited on the connection path (took {:?})",
+        started.elapsed()
     );
 }
 

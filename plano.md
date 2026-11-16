@@ -39,6 +39,8 @@ Fluxo decidido:
 | `CONTROL_API_TIMEOUT_MS` | `2500` | Timeout das chamadas à API. |
 | `CONTROL_API_CACHE_SECS` | `60` | TTL do cache por token (= tempo máx. p/ revogação valer). |
 | `CONTROL_API_SEEN_SECS` | `300` | Throttle do report "peer visto" por ID. |
+| `CONTROL_API_SERVER_NAME` | vazio | Nome público deste hbbs (minúsculas), enviado como `server` em todas as chamadas à API para distinguir servidores redundantes. Vazio = campo não enviado. |
+| `CONTROL_API_JWT_KEYS` | vazio | Chaves públicas Ed25519 da API, `kid=<base64 SPKI>;kid2=...` (a linha do meio do PEM "PUBLIC KEY"). Com a API fora, JWT assinado por uma delas e dentro do `exp` libera o atendente; vazio = sem validação offline (vale só `CONTROL_API_FAIL_OPEN`). |
 
 ## Contrato da minha API (a desenvolver)
 

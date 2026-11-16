@@ -45,6 +45,10 @@ fn spawn_mock(port: u16) -> Guard {
 }
 
 fn spawn_hbbs(port: u16, api_url: Option<&str>) -> Guard {
+    spawn_hbbs_env(port, api_url, &[])
+}
+
+fn spawn_hbbs_env(port: u16, api_url: Option<&str>, extra_env: &[(&str, &str)]) -> Guard {
     let dir = std::env::temp_dir().join(format!("hbbs_e2e_{port}"));
     std::fs::create_dir_all(&dir).expect("create hbbs work dir");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hbbs"));
@@ -56,7 +60,12 @@ fn spawn_hbbs(port: u16, api_url: Option<&str>) -> Guard {
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
     if let Some(url) = api_url {
-        cmd.env("CONTROL_API_URL", url);
+        cmd.env("CONTROL_API_URL", url)
+            // nome deste hbbs nos envios à API (vai em minúsculas, como `server`)
+            .env("CONTROL_API_SERVER_NAME", " HBBS-Teste.LOCAL ");
+    }
+    for (k, v) in extra_env {
+        cmd.env(k, v);
     }
     let child = cmd.spawn().expect("spawn hbbs");
     let guard = Guard(child);
@@ -198,6 +207,16 @@ async fn gate_blocks_and_allows_by_token() {
         state.contains(r#""kind": "punch_hole""#),
         "expected punch_hole events: {state}"
     );
+    // CONTROL_API_SERVER_NAME chega como `server`, aparado e em minúsculas, nos
+    // eventos de tentativa e no peers/seen (distingue os hbbs redundantes).
+    assert!(
+        state.contains(r#""server": "hbbs-teste.local""#),
+        "attempt events must carry the server name: {state}"
+    );
+    assert!(
+        !state.contains("HBBS-Teste"),
+        "server name must be lowercased: {state}"
+    );
     // Os RequestRelay acima repetem (ip, alvo, desfecho) dos punch holes, então
     // o dedupe os suprime: 1 evento por conexão, não um por pacote.
     assert!(
@@ -256,5 +275,105 @@ async fn vanilla_without_api_url_does_not_block() {
         resp.failure.enum_value_or_default(),
         punch_hole_response::Failure::ID_NOT_EXIST,
         "expected plain ID_NOT_EXIST: {resp:?}"
+    );
+}
+
+/// Chave Ed25519 de TESTE (gerada a cada execução) no formato que a API publica:
+/// a linha do meio do PEM "PUBLIC KEY" (SPKI em base64). Nunca a chave de produção.
+fn gen_test_keypair() -> (String, sodiumoxide::crypto::sign::SecretKey) {
+    use sodiumoxide::crypto::sign;
+    sodiumoxide::init().ok();
+    let (pk, sk) = sign::gen_keypair();
+    // SubjectPublicKeyInfo de Ed25519 (RFC 8410): prefixo fixo + 32 bytes da chave.
+    let mut spki = vec![
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+    spki.extend_from_slice(pk.as_ref());
+    (base64::encode(spki), sk)
+}
+
+/// Monta um JWT EdDSA como a API faz: header {alg, typ, kid}, payload, assinatura
+/// Ed25519 sobre "header.payload", tudo em base64url sem padding.
+fn make_jwt(kid: &str, sk: &sodiumoxide::crypto::sign::SecretKey, exp: i64, name: &str) -> String {
+    use sodiumoxide::crypto::sign;
+    let b64 = |b: &[u8]| base64::encode_config(b, base64::URL_SAFE_NO_PAD);
+    let header = b64(format!(r#"{{"alg":"EdDSA","typ":"JWT","kid":"{kid}"}}"#).as_bytes());
+    let now = chrono::Utc::now().timestamp();
+    let payload = b64(
+        format!(
+            r#"{{"sid":"{}","sub":"8","pc":"123456789","name":"{name}","iat":{now},"exp":{exp}}}"#,
+            "a".repeat(64)
+        )
+        .as_bytes(),
+    );
+    let signing_input = format!("{header}.{payload}");
+    let sig = sign::sign_detached(signing_input.as_bytes(), sk);
+    format!("{signing_input}.{}", b64(sig.as_ref()))
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn jwt_offline_only_when_api_is_down() {
+    let (pub_b64, sk) = gen_test_keypair();
+    let (_other_pub, other_sk) = gen_test_keypair();
+    let keys = format!("k1={pub_b64}");
+    let mock = spawn_mock(44999);
+    let _hbbs = spawn_hbbs_env(
+        44116,
+        Some("http://127.0.0.1:44999"),
+        &[("CONTROL_API_JWT_KEYS", keys.as_str())],
+    );
+    let in_1h = chrono::Utc::now().timestamp() + 3600;
+
+    // Com a API de pé, quem decide é ela: JWT válido mas não aprovado na API -> negado.
+    let jwt_nao_aprovado = make_jwt("k1", &sk, in_1h, "fulano");
+    let resp = punch(44116, &jwt_nao_aprovado).await;
+    assert!(
+        resp.other_failure.contains("não autorizado"),
+        "with the API up a JWT must not bypass it: {resp:?}"
+    );
+
+    // API fora do ar (tokens novos, sem cache):
+    drop(mock);
+
+    // JWT válido, assinado pela chave conhecida -> liberado offline.
+    let jwt_ok = make_jwt("k1", &sk, in_1h, "beltrano");
+    let resp = punch(44116, &jwt_ok).await;
+    assert!(
+        resp.other_failure.is_empty(),
+        "valid JWT must be accepted offline: {resp:?}"
+    );
+    // ...e via relay também (mesmo check_token).
+    let rr = request_relay(44116, &jwt_ok).await;
+    assert!(rr.is_none(), "valid JWT must not be refused on relay: {rr:?}");
+
+    // JWT vencido (além da folga de 60 s) -> bloqueado com mensagem de sessão expirada.
+    let jwt_vencido = make_jwt("k1", &sk, chrono::Utc::now().timestamp() - 3600, "beltrano");
+    let resp = punch(44116, &jwt_vencido).await;
+    assert!(
+        resp.other_failure.contains("expirou"),
+        "expired JWT must be refused offline: {resp:?}"
+    );
+
+    // JWT assinado por outra chave (kid conhecido, assinatura errada) -> bloqueado.
+    let jwt_forjado = make_jwt("k1", &other_sk, in_1h, "intruso");
+    let resp = punch(44116, &jwt_forjado).await;
+    assert!(
+        resp.other_failure.contains("indisponível"),
+        "forged JWT must be refused offline: {resp:?}"
+    );
+
+    // kid desconhecido -> bloqueado.
+    let jwt_kid = make_jwt("k9", &sk, in_1h, "beltrano");
+    let resp = punch(44116, &jwt_kid).await;
+    assert!(
+        resp.other_failure.contains("indisponível"),
+        "unknown kid must be refused offline: {resp:?}"
+    );
+
+    // Token opaco antigo com a API fora: comportamento de sempre (fail-closed).
+    let resp = punch(44116, "tok-opaco-antigo").await;
+    assert!(
+        resp.other_failure.contains("indisponível"),
+        "opaque token must keep the fail-closed behavior: {resp:?}"
     );
 }

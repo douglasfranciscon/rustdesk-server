@@ -80,6 +80,8 @@ Se não implementar, só a aba "Catálogo" do app fica sem função. Conexões n
 
 URL base = env var `CONTROL_API_URL` do hbbs. Se `CONTROL_API_TOKEN` estiver configurado no hbbs, toda chamada leva `Authorization: Bearer <CONTROL_API_TOKEN>` — **valide esse header** para que só o hbbs consiga chamar estas rotas.
 
+**Campo `server` (todas as rotas deste grupo, desde 2026-11-16):** com mais de um hbbs (redundância), cada um sobe com `CONTROL_API_SERVER_NAME=<host público em minúsculas>` (ex.: `brremoteserver.brproj.com.br`, `brremoteserverb.brproj.com.br`) e manda esse valor como `"server"` em todo request. Sem a variável o campo **não é enviado** (ausente, nunca `""`): trate como "servidor desconhecido". Uma mesma máquina registrada em dois hbbs chega em `/peers/seen` pelos dois, com `server` diferente — é a mesma máquina (upsert por `id`), guarde o "visto em" **por servidor**. O mesmo host aparece no heartbeat do client (`rendezvous`, `servers[].host`), sem normalização.
+
 ### POST /tokens/verify
 
 Chamado a cada tentativa de conexão de um controlador (com cache de `CONTROL_API_CACHE_SECS`, default 60s). **Precisa responder rápido** — o hbbs usa timeout de `CONTROL_API_TIMEOUT_MS` (default 2500ms).
@@ -87,9 +89,10 @@ Chamado a cada tentativa de conexão de um controlador (com cache de `CONTROL_AP
 Request:
 
 ```json
-{ "token": "<token que o client enviou>", "ip": "200.150.10.20" }
+{ "token": "<token que o client enviou>", "ip": "200.150.10.20", "server": "brremoteserver.brproj.com.br" }
 ```
 
+- `server` (opcional) = hbbs que está perguntando; informativo, não muda a decisão.
 - `ip` = IP público de origem do pedido de conexão. Use para auditoria/cruzamento com o IP do login (detecção de token vazado). Não precisa reprovar por IP diferente se não quiser.
 
 Respostas:
@@ -100,6 +103,31 @@ Respostas:
 
 Observação: token **vazio** nunca chega aqui — o hbbs já bloqueia antes, com mensagem pedindo login.
 
+#### API fora do ar: validação offline do token JWT (desde 2026-11-16)
+
+Com a API fora (timeout ou status inesperado), o hbbs tenta validar **sozinho** o token do atendente,
+se ele for um JWT e se `CONTROL_API_JWT_KEYS` estiver configurada:
+
+- O JWT é o que o `/api/login` (e a renovação em `/api/currentUser`) devolve em `access_token`:
+  header `{"alg":"EdDSA","typ":"JWT","kid":"k1"}`, payload com `sid` (o token opaco de sessão),
+  `sub` (código do login), `pc` (ID RustDesk do PC do atendente), `name` (usuário, vai para o log do
+  hbbs), `iat` e `exp` (7 dias, renovados a cada contato com a API). Assinatura Ed25519 sobre
+  `header.payload`.
+- hbbs confere assinatura (chave pública pelo `kid`) e `exp` com folga de 60 s. Válido → libera e
+  cacheia por `CONTROL_API_CACHE_SECS`; vencido → bloqueia com "sua sessão expirou"; assinatura ou
+  `kid` errados → bloqueia com "servidor de autorização indisponível".
+- **Com a API respondendo, o `exp` é ignorado pelo hbbs**: quem decide é o `/tokens/verify` (200/403).
+  A API também não precisa conferir assinatura: ela usa o `sid` de dentro do JWT.
+- Token **opaco** (sem os dois pontos do JWT) com a API fora continua como sempre
+  (`CONTROL_API_FAIL_OPEN`, default bloqueia).
+- O que a queda congela: revogação (atendente cortado segue até o `exp`), trava de acessos
+  simultâneos, auditoria `/connections/attempt` (fire-and-forget, perde), e o `user` do log vem do
+  claim `name`.
+- Rotação de chave: `CONTROL_API_JWT_KEYS` aceita várias (`k1=...;k2=...`). Publicar a nova nos
+  hbbs **antes** de a API passar a assinar com ela; tirar a velha só depois de 7 dias.
+- Códigos novos em `/connections/attempt` → `result`: `jwt_expired` e `jwt_invalid` (ambos só
+  ocorrem com a API fora).
+
 ### POST /peers/seen
 
 Telemetria/inventário — chamado quando qualquer peer (controlado ou controlador) se registra no hbbs. Com throttle por ID (`CONTROL_API_SEEN_SECS`, default 300s). Fire-and-forget: a resposta é ignorada (não-2xx só gera log). Nunca bloqueia nada.
@@ -107,13 +135,14 @@ Telemetria/inventário — chamado quando qualquer peer (controlado ou controlad
 Request:
 
 ```json
-{ "id": "123456789", "ip": "200.150.10.20" }
+{ "id": "123456789", "ip": "200.150.10.20", "server": "brremoteserver.brproj.com.br" }
 ```
 
 Comportamento esperado (upsert):
 
 - ID novo → cadastra com status "pendente" (vira o inventário de máquinas vistas pelo servidor).
 - ID existente → atualiza `last_seen` e `ip`.
+- Com `server`: atualiza também o "visto em" daquele servidor (par `id` + `server`). Sem `server`: só o geral.
 
 ### POST /connections/attempt
 
@@ -150,6 +179,7 @@ Request:
 | `version` | sim | Versão do client RustDesk. `null` quando `kind = "relay"`. |
 | `via` | não | `tcp` ou `ws` (WebSocket). |
 | `at` | não | Timestamp UTC RFC3339 com segundos e sufixo `Z`. |
+| `server` | ausente | hbbs que autorizou/negou (`CONTROL_API_SERVER_NAME`). **Ausente** quando o hbbs não tem a variável. |
 
 Valores de `result`:
 

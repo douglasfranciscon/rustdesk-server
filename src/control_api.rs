@@ -9,6 +9,10 @@ use std::time::{Duration, Instant};
 const MSG_LOGIN_REQUIRED: &str = "Acesso negado: faça login no aplicativo para conectar.";
 const MSG_DENIED: &str = "Acesso negado: usuário não autorizado.";
 const MSG_API_DOWN: &str = "Servidor de autorização indisponível. Tente novamente em instantes.";
+const MSG_JWT_EXPIRED: &str =
+    "Servidor de autorização indisponível e sua sessão expirou: faça login novamente quando ele voltar.";
+/// Tolerância de relógio entre a API (que assina) e este hbbs ao conferir `exp`.
+const JWT_LEEWAY_SECS: u64 = 60;
 const MAX_CACHE_ENTRIES: usize = 10_000;
 const MAX_BLOCK_ENTRIES: usize = 100;
 
@@ -21,6 +25,42 @@ struct Config {
     seen_secs: u64,
     attempts: bool,
     attempt_dedupe_secs: u64,
+    /// Nome publico deste hbbs (CONTROL_API_SERVER_NAME), enviado como `server` a
+    /// API para distinguir os servidores redundantes. Vazio = campo nao enviado.
+    server_name: String,
+    /// Chaves públicas Ed25519 (kid -> chave) que validam o token JWT do atendente
+    /// OFFLINE, só quando a API não responde (CONTROL_API_JWT_KEYS). Vazio = sem
+    /// validação offline: API fora aplica `fail_open` como sempre.
+    jwt_keys: HashMap<String, jsonwebtoken::DecodingKey>,
+}
+
+/// CONTROL_API_JWT_KEYS = "k1=<base64 SPKI ou PEM>;k2=..." (separador `;` ou `,`).
+/// Aceita a linha do meio do PEM "PUBLIC KEY" (SPKI em base64) ou o PEM inteiro.
+fn parse_jwt_keys(raw: &str) -> HashMap<String, jsonwebtoken::DecodingKey> {
+    let mut keys = HashMap::new();
+    for entry in raw.split([';', ',']).map(str::trim).filter(|e| !e.is_empty()) {
+        let Some((kid, value)) = entry.split_once('=') else {
+            log::error!("BR_SUPORTE: CONTROL_API_JWT_KEYS: entrada sem '=' ignorada: {:?}", entry);
+            continue;
+        };
+        let (kid, value) = (kid.trim(), value.trim());
+        let pem = if value.contains("-----BEGIN") {
+            value.replace("\\n", "\n")
+        } else {
+            format!("-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n", value)
+        };
+        match jsonwebtoken::DecodingKey::from_ed_pem(pem.as_bytes()) {
+            Ok(key) => {
+                keys.insert(kid.to_owned(), key);
+            }
+            Err(err) => log::error!(
+                "BR_SUPORTE: CONTROL_API_JWT_KEYS: chave kid={} inválida, ignorada: {}",
+                kid,
+                err
+            ),
+        }
+    }
+    keys
 }
 
 static CONFIG: Lazy<Config> = Lazy::new(|| {
@@ -43,13 +83,17 @@ static CONFIG: Lazy<Config> = Lazy::new(|| {
         attempt_dedupe_secs: get_arg_or("control_api_attempt_dedupe_secs", "60".to_owned())
             .parse()
             .unwrap_or(60),
+        server_name: get_arg("control_api_server_name").trim().to_lowercase(),
+        jwt_keys: parse_jwt_keys(&get_arg("control_api_jwt_keys")),
     };
     if config.url.is_empty() {
         log::info!("BR_SUPORTE: CONTROL_API_URL vazio, feature DESLIGADA (comportamento vanilla)");
     } else {
         log::info!(
-            "BR_SUPORTE: LIGADO url={} fail_open={} timeout_ms={} cache_secs={} seen_secs={} attempts={} attempt_dedupe_secs={} auth_bearer={}",
+            "BR_SUPORTE: LIGADO url={} server_name={:?} jwt_kids={:?} fail_open={} timeout_ms={} cache_secs={} seen_secs={} attempts={} attempt_dedupe_secs={} auth_bearer={}",
             config.url,
+            config.server_name,
+            config.jwt_keys.keys().collect::<Vec<_>>(),
             config.fail_open,
             config.timeout_ms,
             config.cache_secs,
@@ -95,6 +139,10 @@ pub enum Denial {
     LoginRequired,
     NotAuthorized,
     ApiDown,
+    /// API fora e o JWT do atendente venceu (ou ainda não vale).
+    JwtExpired,
+    /// API fora e o JWT não confere (assinatura, kid desconhecido, alg, formato).
+    JwtInvalid,
 }
 
 impl Denial {
@@ -102,7 +150,8 @@ impl Denial {
         match self {
             Denial::LoginRequired => MSG_LOGIN_REQUIRED,
             Denial::NotAuthorized => MSG_DENIED,
-            Denial::ApiDown => MSG_API_DOWN,
+            Denial::ApiDown | Denial::JwtInvalid => MSG_API_DOWN,
+            Denial::JwtExpired => MSG_JWT_EXPIRED,
         }
     }
 
@@ -111,7 +160,61 @@ impl Denial {
             Denial::LoginRequired => "login_required",
             Denial::NotAuthorized => "denied",
             Denial::ApiDown => "api_down",
+            Denial::JwtExpired => "jwt_expired",
+            Denial::JwtInvalid => "jwt_invalid",
         }
+    }
+}
+
+/// Um JWT tem três partes separadas por ponto; o token opaco da API não tem ponto.
+fn looks_like_jwt(token: &str) -> bool {
+    token.matches('.').count() == 2
+}
+
+/// Valida o JWT do atendente sem a API: assinatura Ed25519 com uma das chaves de
+/// CONTROL_API_JWT_KEYS (pelo `kid` do header) e `exp` com folga. Devolve o nome
+/// do atendente (claim `name`) para o log. Só é chamado quando a API não responde.
+fn verify_jwt_offline(token: &str) -> Result<Option<String>, Denial> {
+    use jsonwebtoken::{decode, decode_header, errors::ErrorKind, Algorithm, Validation};
+    let header = decode_header(token).map_err(|err| {
+        log::warn!("BR_SUPORTE: JWT offline: header inválido: {}", err);
+        Denial::JwtInvalid
+    })?;
+    if header.alg != Algorithm::EdDSA {
+        log::warn!("BR_SUPORTE: JWT offline: alg {:?} não é EdDSA", header.alg);
+        return Err(Denial::JwtInvalid);
+    }
+    let kid = header.kid.unwrap_or_default();
+    let Some(key) = CONFIG.jwt_keys.get(&kid) else {
+        log::warn!(
+            "BR_SUPORTE: JWT offline: kid={:?} desconhecido (conhecidos: {:?})",
+            kid,
+            CONFIG.jwt_keys.keys().collect::<Vec<_>>()
+        );
+        return Err(Denial::JwtInvalid);
+    };
+    let mut validation = Validation::new(Algorithm::EdDSA);
+    validation.leeway = JWT_LEEWAY_SECS;
+    validation.validate_exp = true;
+    match decode::<serde_json::Value>(token, key, &validation) {
+        Ok(data) => {
+            let name = data
+                .claims
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            Ok(name)
+        }
+        Err(err) => match err.kind() {
+            ErrorKind::ExpiredSignature | ErrorKind::ImmatureSignature => {
+                log::warn!("BR_SUPORTE: JWT offline: vencido ({})", err);
+                Err(Denial::JwtExpired)
+            }
+            _ => {
+                log::warn!("BR_SUPORTE: JWT offline: inválido ({})", err);
+                Err(Denial::JwtInvalid)
+            }
+        },
     }
 }
 
@@ -123,6 +226,18 @@ static BLOCKS: Lazy<Mutex<Vec<BlockEntry>>> = Lazy::new(Default::default);
 #[inline]
 pub fn is_enabled() -> bool {
     !CONFIG.url.is_empty()
+}
+
+/// Adds `"server": <CONTROL_API_SERVER_NAME>` to a JSON body when configured.
+/// Without the variable the field is absent (never an empty string), so the API
+/// can tell "unknown" from a named server.
+fn with_server(mut body: serde_json::Value) -> serde_json::Value {
+    if !CONFIG.server_name.is_empty() {
+        if let Some(obj) = body.as_object_mut() {
+            obj.insert("server".to_owned(), CONFIG.server_name.clone().into());
+        }
+    }
+    body
 }
 
 /// Checks whether the given client token belongs to an authorized controller.
@@ -191,6 +306,41 @@ pub async fn check_token(token: &str, ip: &str) -> Result<Option<String>, Denial
                 Err(Denial::NotAuthorized)
             }
         }
+        Err(err) if looks_like_jwt(token) && !CONFIG.jwt_keys.is_empty() => {
+            // API fora: o JWT assinado por ela vale sozinho até vencer (janela que
+            // a API renova a cada contato). Token opaco antigo cai no braço abaixo.
+            let result = verify_jwt_offline(token);
+            match &result {
+                Ok(user) => log::warn!(
+                    "BR_SUPORTE: verify FALHOU ({}) -> JWT válido OFFLINE token={}... user={:?} => LIBERADO",
+                    err,
+                    token_prefix,
+                    user
+                ),
+                Err(denial) => log::warn!(
+                    "BR_SUPORTE: verify FALHOU ({}) -> JWT offline recusado ({}) token={}... => BLOQUEADO",
+                    err,
+                    denial.code(),
+                    token_prefix
+                ),
+            }
+            if let Ok(user) = &result {
+                let mut cache = TOKEN_CACHE.lock().await;
+                if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(token) {
+                    let ttl = CONFIG.cache_secs;
+                    cache.retain(|_, e| now.duration_since(e.tm).as_secs() < ttl);
+                }
+                cache.insert(
+                    token.to_owned(),
+                    TokenEntry {
+                        authorized: true,
+                        user: user.clone(),
+                        tm: now,
+                    },
+                );
+            }
+            result
+        }
         Err(err) => {
             log::warn!(
                 "BR_SUPORTE: verify FALHOU ({}) -> fail_open={} => {}",
@@ -213,7 +363,7 @@ async fn call_verify(token: &str, ip: &str) -> Result<(bool, Option<String>), St
         .ok_or_else(|| "http client unavailable".to_owned())?;
     let mut req = client
         .post(format!("{}/tokens/verify", CONFIG.url))
-        .json(&serde_json::json!({ "token": token, "ip": ip }));
+        .json(&with_server(serde_json::json!({ "token": token, "ip": ip })));
     if !CONFIG.token.is_empty() {
         req = req.bearer_auth(&CONFIG.token);
     }
@@ -271,7 +421,7 @@ pub async fn report_seen(id: &str, ip: String) {
         if let Some(client) = HTTP.as_ref() {
             let mut req = client
                 .post(format!("{}/peers/seen", CONFIG.url))
-                .json(&serde_json::json!({ "id": id, "ip": ip }));
+                .json(&with_server(serde_json::json!({ "id": id, "ip": ip })));
             if !CONFIG.token.is_empty() {
                 req = req.bearer_auth(&CONFIG.token);
             }
@@ -351,7 +501,7 @@ pub async fn report_attempt(a: Attempt<'_>) {
         }
         sent.insert(key.clone(), now);
     }
-    let body = serde_json::json!({
+    let body = with_server(serde_json::json!({
         "target_id": a.target_id,
         "ip": a.from_ip,
         "token": a.token,
@@ -363,7 +513,7 @@ pub async fn report_attempt(a: Attempt<'_>) {
         "version": a.version,
         "via": a.via,
         "at": chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-    });
+    }));
     log::info!(
         "BR_SUPORTE: connections/attempt enviando {} kind={} user={:?}",
         key,
@@ -431,6 +581,13 @@ pub async fn diag() -> String {
         return res;
     }
     let _ = writeln!(res, "url: {}", CONFIG.url);
+    let _ = writeln!(res, "server_name: {:?}", CONFIG.server_name);
+    let _ = writeln!(
+        res,
+        "jwt_kids: {:?} (leeway {}s)",
+        CONFIG.jwt_keys.keys().collect::<Vec<_>>(),
+        JWT_LEEWAY_SECS
+    );
     let _ = writeln!(res, "fail_open: {}", CONFIG.fail_open);
     let _ = writeln!(
         res,

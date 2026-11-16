@@ -71,16 +71,21 @@ class Handler(BaseHTTPRequestHandler):
         if url.path == "/tokens/verify":
             token = body.get("token", "")
             ip = body.get("ip", "")
+            srv = body.get("server")
             if token in APPROVED:
-                print(f"  verify OK token={token!r} ip={ip}")
+                print(f"  verify OK token={token!r} ip={ip} server={srv}")
                 self._send(200, {"user": "douglas"})
             else:
-                print(f"  verify NEGADO token={token!r} ip={ip}")
+                print(f"  verify NEGADO token={token!r} ip={ip} server={srv}")
                 self._send(403)
         elif url.path == "/peers/seen":
             pid = body.get("id", "")
-            PEERS_SEEN[pid] = {"ip": body.get("ip", ""), "last_seen": datetime.now().isoformat()}
-            print(f"  peer visto id={pid} ip={body.get('ip')}")
+            PEERS_SEEN[pid] = {
+                "ip": body.get("ip", ""),
+                "server": body.get("server"),
+                "last_seen": datetime.now().isoformat(),
+            }
+            print(f"  peer visto id={pid} ip={body.get('ip')} server={body.get('server')}")
             self._send(200)
         elif url.path == "/connections/attempt":
             if len(ATTEMPTS) >= MAX_ATTEMPTS:
@@ -89,6 +94,7 @@ class Handler(BaseHTTPRequestHandler):
             print(
                 f"  tentativa {body.get('result')} kind={body.get('kind')}"
                 f" alvo={body.get('target_id')} ip={body.get('ip')} user={body.get('user')}"
+                f" server={body.get('server')}"
             )
             self._send(200)
         elif url.path == "/api/login":

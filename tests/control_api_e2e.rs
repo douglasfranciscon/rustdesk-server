@@ -51,6 +51,11 @@ fn spawn_hbbs(port: u16, api_url: Option<&str>) -> Guard {
 fn spawn_hbbs_env(port: u16, api_url: Option<&str>, extra_env: &[(&str, &str)]) -> Guard {
     let dir = std::env::temp_dir().join(format!("hbbs_e2e_{port}"));
     std::fs::create_dir_all(&dir).expect("create hbbs work dir");
+    // sqlite de peers zerado: um registro de uma rodada anterior mudaria o
+    // resultado do RegisterPk (uuid já conhecido)
+    for f in ["db_v2.sqlite3", "db_v2.sqlite3-wal", "db_v2.sqlite3-shm"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_hbbs"));
     cmd.current_dir(&dir)
         .env("PORT", port.to_string())
@@ -73,17 +78,21 @@ fn spawn_hbbs_env(port: u16, api_url: Option<&str>, extra_env: &[(&str, &str)]) 
     guard
 }
 
-/// Raw HTTP/1.0 GET of the mock's /_state (the test crate has no http client).
-fn mock_state(port: u16) -> String {
+/// Raw HTTP/1.0 GET of a mock path (the test crate has no http client).
+fn mock_get(port: u16, path: &str) -> String {
     use std::io::{Read as _, Write as _};
     let mut stream =
         std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect to mock api");
     stream
-        .write_all(b"GET /_state HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n")
-        .expect("send /_state request");
+        .write_all(format!("GET {path} HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n").as_bytes())
+        .expect("send mock request");
     let mut body = String::new();
-    stream.read_to_string(&mut body).expect("read /_state");
+    stream.read_to_string(&mut body).expect("read mock response");
     body
+}
+
+fn mock_state(port: u16) -> String {
+    mock_get(port, "/_state")
 }
 
 /// The attempt events are posted from a detached task, so poll for them.
@@ -96,6 +105,31 @@ fn wait_for_attempt(port: u16, needle: &str) -> String {
         std::thread::sleep(Duration::from_millis(100));
     }
     panic!("attempt {needle} never reached the mock api:\n{}", mock_state(port));
+}
+
+/// RegisterPk over tcp (the path logged-in clients use) and its result.
+async fn register_pk(port: u16, id: &str, uuid: &str) -> register_pk_response::Result {
+    let mut stream = connect(port).await;
+    let mut msg = RendezvousMessage::new();
+    msg.set_register_pk(RegisterPk {
+        id: id.to_owned(),
+        uuid: uuid.as_bytes().to_vec().into(),
+        pk: b"pk-de-teste".to_vec().into(),
+        ..Default::default()
+    });
+    stream.send(&msg).await.expect("send register pk");
+    for _ in 0..3 {
+        let bytes = stream
+            .next_timeout(5000)
+            .await
+            .expect("no response to register pk")
+            .expect("read response");
+        let resp = RendezvousMessage::parse_from_bytes(&bytes).expect("parse response");
+        if let Some(rendezvous_message::Union::RegisterPkResponse(r)) = resp.union {
+            return r.result.enum_value_or_default();
+        }
+    }
+    panic!("no RegisterPkResponse for {id}");
 }
 
 async fn connect(port: u16) -> FramedStream {
@@ -261,6 +295,70 @@ async fn attempt_post_failure_does_not_block() {
         started.elapsed() < Duration::from_millis(1500),
         "the audit post must not be awaited on the connection path (took {:?})",
         started.elapsed()
+    );
+}
+
+/// O dono de um ID é decidido pela API (POST /peers/registro), para a unicidade
+/// valer entre os hbbs redundantes: só-log por default, UUID_MISMATCH com
+/// CONTROL_API_REGISTER_ENFORCE=Y, e fail-open quando a rota não responde.
+#[tokio::test(flavor = "multi_thread")]
+async fn registration_owner_is_decided_by_the_api() {
+    let _mock = spawn_mock(42999);
+    // 555444333 e 555444334 já pertencem a outra máquina ("dono-original").
+    mock_get(42999, "/_own?id=555444333&uuid=ZG9uby1vcmlnaW5hbA==");
+    mock_get(42999, "/_own?id=555444334&uuid=ZG9uby1vcmlnaW5hbA==");
+
+    // Default (só log): o conflito chega à API, mas o registro é aceito.
+    let hbbs_log = spawn_hbbs(42116, Some("http://127.0.0.1:42999"));
+    assert_eq!(
+        register_pk(42116, "555444333", "maquina-b").await,
+        register_pk_response::Result::OK,
+        "sem ENFORCE o conflito é só logado"
+    );
+    let state = wait_for_attempt(42999, r#""motivo": "uuid_mismatch""#);
+    // uuid em base64, igual ao que o app manda à API; `server` identifica o hbbs
+    assert!(
+        state.contains(r#""uuid": "bWFxdWluYS1i""#),
+        "uuid must be sent as base64: {state}"
+    );
+    assert!(
+        state.contains(r#""server": "hbbs-teste.local""#),
+        "registro must carry the server name: {state}"
+    );
+    drop(hbbs_log);
+
+    // ENFORCE=Y: o mesmo registro recebe UUID_MISMATCH (o client sorteia outro ID).
+    let _hbbs = spawn_hbbs_env(
+        42117,
+        Some("http://127.0.0.1:42999"),
+        &[("CONTROL_API_REGISTER_ENFORCE", "Y")],
+    );
+    assert_eq!(
+        register_pk(42117, "555444333", "maquina-b").await,
+        register_pk_response::Result::UUID_MISMATCH,
+        "ID de outra máquina deve ser recusado"
+    );
+    // ID sem dono: esta máquina vira dona; repetir com o mesmo uuid segue aceito.
+    assert_eq!(
+        register_pk(42117, "555444335", "maquina-b").await,
+        register_pk_response::Result::OK
+    );
+    assert_eq!(
+        register_pk(42117, "555444335", "maquina-b").await,
+        register_pk_response::Result::OK
+    );
+    // Rota fora do ar (404): fail-open mesmo com ENFORCE=Y e dono diferente.
+    mock_get(42999, "/_registro?on=0");
+    assert_eq!(
+        register_pk(42117, "555444334", "maquina-c").await,
+        register_pk_response::Result::OK,
+        "rota ausente nunca impede um registro"
+    );
+    // A defesa local continua: outro uuid para um ID que este hbbs já gravou.
+    assert_eq!(
+        register_pk(42117, "555444334", "maquina-d").await,
+        register_pk_response::Result::UUID_MISMATCH,
+        "uuid diferente do gravado localmente"
     );
 }
 

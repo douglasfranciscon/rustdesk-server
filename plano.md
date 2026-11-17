@@ -27,6 +27,7 @@ Fluxo decidido:
 - **Gate no `handle_punch_hole_request`** ([src/rendezvous_server.rs](src/rendezvous_server.rs)): valida `ph.token` logo após a checagem de `licence_key`; negado → `PunchHoleResponse.other_failure` com a mensagem (client exibe).
 - **Gate no handler de `RequestRelay`**: mesmo bloqueio (senão seria bypass — client modificado pediria relay direto sem punch hole); negado → `RelayResponse.refuse_reason`.
 - **Telemetria**: `RegisterPeer`/`RegisterPk` reportam `POST /peers/seen {id, ip}` (fire-and-forget, com throttle; API fora do ar não afeta nada).
+- **Dono do ID** (2026-11-17): `RegisterPk` consulta `POST /peers/registro {id, uuid, ip}` antes de aceitar; `ok:false` + `CONTROL_API_REGISTER_ENFORCE=Y` → `UUID_MISMATCH` (o client sorteia outro ID). Fail-open em qualquer falha. No UDP a consulta roda numa task e a resposta volta pelo canal interno, para não segurar o laço. Junto: `update_addr` passa a pedir pk quando o endereço (ip **ou porta**) muda, fechando o caso de duas máquinas com o mesmo ID na mesma rede trocando de endereço sem conferir uuid.
 - **Console local**: comando `control-api` (ou `ca`) mostra config, cache de tokens e últimos bloqueios.
 
 ### Configuração (env vars / .env / flags)
@@ -41,6 +42,10 @@ Fluxo decidido:
 | `CONTROL_API_SEEN_SECS` | `300` | Throttle do report "peer visto" por ID. |
 | `CONTROL_API_SERVER_NAME` | vazio | Nome público deste hbbs (minúsculas), enviado como `server` em todas as chamadas à API para distinguir servidores redundantes. Vazio = campo não enviado. |
 | `CONTROL_API_JWT_KEYS` | vazio | Chaves públicas Ed25519 da API, `kid=<base64 SPKI>;kid2=...` (a linha do meio do PEM "PUBLIC KEY"). Com a API fora, JWT assinado por uma delas e dentro do `exp` libera o atendente; vazio = sem validação offline (vale só `CONTROL_API_FAIL_OPEN`). |
+| `CONTROL_API_REGISTER` | `Y` | Consulta `POST /peers/registro` a cada `RegisterPk` (dono do ID entre os hbbs). `N` = não consulta. |
+| `CONTROL_API_REGISTER_ENFORCE` | `N` | `Y` = ID de outra máquina recebe `UUID_MISMATCH` e o client sorteia outro ID. `N` = só registra o conflito no log (período de aprendizado). |
+| `CONTROL_API_REGISTER_TIMEOUT_MS` | `1500` | Timeout da consulta do dono do ID (aguardada no registro; estourou = aceita). |
+| `CONTROL_API_REGISTER_CACHE_SECS` | `300` | TTL do cache `id`+`uuid` aceito, para não repetir a consulta. |
 
 ## Contrato da minha API (a desenvolver)
 

@@ -144,6 +144,31 @@ Comportamento esperado (upsert):
 - ID existente → atualiza `last_seen` e `ip`.
 - Com `server`: atualiza também o "visto em" daquele servidor (par `id` + `server`). Sem `server`: só o geral.
 
+### POST /peers/registro
+
+Dono do ID — chamado a cada `RegisterPk` (registro da chave de uma máquina controlada: no primeiro contato, quando o IP ou a porta mudam, e a cada conexão dos clients logados). Existe porque a unicidade do ID no hbbs vale só dentro de cada servidor: com dois hbbs, duas máquinas com o mesmo ID (MAC igual, `BRRemote.toml` copiado) podem ficar uma em cada um sem que nenhuma receba `UUID_MISMATCH`. Como os dois hbbs perguntam à mesma API, a unicidade passa a ser uma só.
+
+**Precisa responder rápido**: o hbbs espera a resposta antes de aceitar o registro, com timeout de `CONTROL_API_REGISTER_TIMEOUT_MS` (default 1500ms), e cacheia o par `id`+`uuid` aceito por `CONTROL_API_REGISTER_CACHE_SECS` (default 300s).
+
+Request:
+
+```json
+{ "id": "206524240", "uuid": "MjZmZGJkZTctZThlZS00NTE2LTgwYjctOTBlMjk4ZGQ4NTFj", "ip": "189.113.249.64", "server": "brremoteserver.brproj.com.br" }
+```
+
+- `id` (até 30 caracteres) e `uuid` (até 100) são obrigatórios. `uuid` = machine-uid da máquina em **base64**, o mesmo valor que o app manda no `/api/login` e no registro do catálogo.
+- `ip` = IP público de onde a máquina se registrou; `server` como nas outras rotas (ausente sem `CONTROL_API_SERVER_NAME`). Os dois são o que mostra de onde veio cada conflito.
+
+Respostas:
+
+- **200** `{ "ok": true }` → o ID não tinha dono (este `uuid` passa a ser o dono) ou o `uuid` é o dono. O hbbs aceita o registro.
+- **200** `{ "ok": false, "motivo": "uuid_mismatch" }` → o ID pertence a outro `uuid`. A API grava o conflito sempre. O que o hbbs faz depende de `CONTROL_API_REGISTER_ENFORCE`: `N` (default) só registra no log e aceita; `Y` responde `UUID_MISMATCH` ao client, que sorteia um ID novo de 10 dígitos e se registra de novo.
+- 400 (sem `id`/`uuid`), 401, 404 (rota ainda não publicada), 5xx, timeout ou corpo sem `ok` → **fail-open**: o hbbs aceita o registro como antes e loga. A rota nunca impede uma máquina de se registrar por indisponibilidade.
+
+Corrida entre os dois hbbs registrando o mesmo ID novo no mesmo instante: a API garante um dono só (chave primária) e a segunda chamada recebe a resposta certa, não 500.
+
+Kill switch no hbbs: `CONTROL_API_REGISTER=N` desliga só esta consulta.
+
 ### POST /connections/attempt
 
 Auditoria — chamado a cada tentativa de conexão de um controlador, **autorizada ou bloqueada**. Fire-and-forget: a resposta é completamente ignorada (não-2xx só gera log). **Nunca bloqueia, atrasa nem altera uma conexão** — erro, timeout, 404 ou API fora do ar não têm nenhuma consequência. Se você precisa recusar conexões, isso é feito no `/tokens/verify` respondendo 403.
@@ -205,6 +230,7 @@ Kill switch no hbbs: `CONTROL_API_ATTEMPTS=N` desliga só estes eventos, sem afe
 - **users**: id, username, password_hash, ativo (bool), criado_em.
 - **sessions**: token (opaco, ex: UUID/random 32 bytes), user_id, rustdesk_id, uuid_maquina, ip_login, criado_em, revogado_em (null = ativa). Sessão única = no login, revogar as sessões anteriores do mesmo user.
 - **peers**: rustdesk_id (unique), ip, status (pendente/…), first_seen, last_seen. Alimentada por `/peers/seen`.
+- **donos_de_id**: rustdesk_id (PK), uuid, criado_em, visto_em, servidor. Alimentada por `/peers/registro`; conflitos (`ok:false`) em lista própria para decidir qual máquina fica com o número.
 - **connection_attempts**: at, received_at, target_id, ip, user_id (null), session_id (null), user_name (null), result, reason (null), kind, conn_type, version (null), via. Alimentada por `/connections/attempt`; índices por `at`, `user_id`, `target_id`.
 
 ## Regras de negócio que ficam na API (não no hbbs)

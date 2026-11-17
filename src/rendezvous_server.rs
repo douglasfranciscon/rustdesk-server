@@ -404,13 +404,25 @@ impl RendezvousServer {
                     }
                     match self.handle_register_pk(rk, addr, false).await {
                         Err(err) => return send_rk_res(socket, addr, err).await,
-                        Ok(res) => {
-                            let mut msg_out = RendezvousMessage::new();
-                            msg_out.set_register_pk_response(RegisterPkResponse {
-                                result: res.into(),
-                                ..Default::default()
+                        Ok(pending) if crate::control_api::registration_enabled() => {
+                            // a consulta do dono do ID a API de controle (ate
+                            // CONTROL_API_REGISTER_TIMEOUT_MS) nao pode segurar o laco
+                            // UDP: termina numa task e a resposta volta pelo canal `tx`
+                            let mut pm = self.pm.clone();
+                            let tx = self.tx.clone();
+                            tokio::spawn(async move {
+                                let res = pending.complete(&mut pm).await;
+                                let mut msg_out = RendezvousMessage::new();
+                                msg_out.set_register_pk_response(RegisterPkResponse {
+                                    result: res.into(),
+                                    ..Default::default()
+                                });
+                                tx.send(Data::Msg(msg_out.into(), addr)).ok();
                             });
-                            socket.send(&msg_out, addr).await?
+                        }
+                        Ok(pending) => {
+                            let res = pending.complete(&mut self.pm).await;
+                            return send_rk_res(socket, addr, res).await;
                         }
                     }
                 }
@@ -644,8 +656,17 @@ impl RendezvousServer {
                     Self::send_to_sink(sink, msg_out).await;
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
-                    // logged-in clients (>= 1.4.1) register their pk over tcp/ws
-                    match self.handle_register_pk(rk, addr, ws).await {
+                    // logged-in clients (>= 1.4.1) register their pk over tcp/ws.
+                    // Roda na task da conexao: a consulta a API de controle dentro
+                    // de `complete` espera so este client.
+                    let res = match self.handle_register_pk(rk, addr, ws).await {
+                        Err(err) => Err(err),
+                        Ok(pending) => match pending.complete(&mut self.pm).await {
+                            register_pk_response::Result::OK => Ok(register_pk_response::Result::OK),
+                            err => Err(err),
+                        },
+                    };
+                    match res {
                         Err(err) => {
                             let mut msg_out = RendezvousMessage::new();
                             msg_out.set_register_pk_response(RegisterPkResponse {
@@ -686,7 +707,7 @@ impl RendezvousServer {
         rk: RegisterPk,
         addr: SocketAddr,
         ws: bool,
-    ) -> Result<register_pk_response::Result, register_pk_response::Result> {
+    ) -> Result<PendingRegistration, register_pk_response::Result> {
         if rk.uuid.is_empty() || rk.pk.is_empty() {
             return Err(UUID_MISMATCH);
         }
@@ -761,12 +782,16 @@ impl RendezvousServer {
                 );
             }
         }
-        crate::control_api::report_seen(&id, ip.clone()).await;
-        if changed || ws {
+        Ok(PendingRegistration {
+            id,
+            peer,
+            addr,
+            uuid: rk.uuid,
+            pk: rk.pk,
+            ip,
             // ws peers keep their reg time fresh through this path
-            self.pm.update_pk(id, peer, addr, rk.uuid, rk.pk, ip).await;
-        }
-        Ok(register_pk_response::Result::OK)
+            store: changed || ws,
+        })
     }
 
     #[inline]
@@ -779,7 +804,16 @@ impl RendezvousServer {
             } else {
                 ip.to_string() != old.info.ip
             } && !ip.is_loopback();
-            let request_pk = old.pk.is_empty() || ip_change;
+            // Endereco (ip:porta) diferente do registrado: ou a mesma maquina atras
+            // de um NAT que trocou a porta, ou OUTRA maquina com o mesmo ID na mesma
+            // rede (BRRemote.toml copiado, MAC igual). So o RegisterPk distingue, pelo
+            // uuid; entao pede pk em vez de assumir o endereco novo em silencio.
+            let addr_change = old.socket_addr != socket_addr && !ip.is_loopback();
+            // Peer que esteve fora (sem RegisterPeer por mais de REG_TIMEOUT) e voltou:
+            // e o momento em que outra maquina com o mesmo ID pode ter tomado o lugar,
+            // mesmo no mesmo ip:porta. Confere o uuid (e o dono do ID na API) de novo.
+            let came_back = old.last_reg_time.elapsed().as_millis() as i64 >= REG_TIMEOUT;
+            let request_pk = old.pk.is_empty() || ip_change || addr_change || came_back;
             if !request_pk {
                 old.socket_addr = socket_addr;
                 old.last_reg_time = Instant::now();
@@ -1622,6 +1656,44 @@ async fn test_hbbs(addr: SocketAddr) -> ResultType<()> {
               }
           }
         }
+    }
+}
+
+/// RegisterPk que passou pelas checagens locais (uuid/pk/throttle) e ainda
+/// precisa confirmar o dono do ID na API de controle e gravar o peer.
+struct PendingRegistration {
+    id: String,
+    peer: LockPeer,
+    addr: SocketAddr,
+    uuid: hbb_common::bytes::Bytes,
+    pk: hbb_common::bytes::Bytes,
+    ip: String,
+    /// uuid/pk/ip mudaram (ou e ws): grava no mapa e no sqlite via update_pk
+    store: bool,
+}
+
+impl PendingRegistration {
+    async fn complete(self, pm: &mut PeerMap) -> register_pk_response::Result {
+        // A unicidade do ID entre os hbbs redundantes e decidida pela API. Com
+        // API fora, 404 ou CONTROL_API_REGISTER_ENFORCE=N ela sempre "aceita"
+        // (fail-open) e o comportamento e o de antes.
+        let ip_v4 = try_into_v4(self.addr).ip().to_string();
+        if !crate::control_api::check_registration(&self.id, &self.uuid, &ip_v4).await {
+            return register_pk_response::Result::UUID_MISMATCH;
+        }
+        crate::control_api::report_seen(&self.id, self.ip.clone()).await;
+        if self.store {
+            pm.update_pk(self.id, self.peer, self.addr, self.uuid, self.pk, self.ip)
+                .await;
+        } else {
+            // so o endereco mudou (update_addr pediu pk para conferir o uuid) e o
+            // uuid bateu: mesma maquina. Atualiza endereco e tempo de registro, que
+            // update_addr deixou parados enquanto esperava esta confirmacao.
+            let mut w = self.peer.write().await;
+            w.socket_addr = self.addr;
+            w.last_reg_time = Instant::now();
+        }
+        register_pk_response::Result::OK
     }
 }
 

@@ -3,6 +3,7 @@
 Endpoints do contrato:
   POST /tokens/verify        {"token": "...", "ip": "..."} -> 200 {"user": "..."} | 403
   POST /peers/seen           {"id": "...", "ip": "..."}    -> 200
+  POST /peers/registro       {"id": "...", "uuid": "..."}  -> 200 {"ok": true} | {"ok": false, "motivo": "uuid_mismatch"}
   POST /connections/attempt  {"target_id": ..., "result": ...} -> 200 (auditoria)
   POST /api/login            -> devolve access_token fixo "tok-aprovado"
   POST /api/currentUser, /api/logout, /api/heartbeat, /api/sysinfo -> 200 {}
@@ -10,7 +11,9 @@ Endpoints do contrato:
 Endpoints de teste (controle do mock em runtime):
   GET /_approve?token=X  -> adiciona X aos aprovados
   GET /_revoke?token=X   -> remove X dos aprovados
-  GET /_state            -> mostra aprovados, peers vistos e tentativas
+  GET /_own?id=X&uuid=Y  -> define Y como dono do ID X (simula outra maquina)
+  GET /_registro?on=0|1  -> desliga/liga a rota /peers/registro (404 = rota nao publicada)
+  GET /_state            -> mostra aprovados, peers vistos, tentativas, donos e registros
 
 Uso: python mock_api.py [porta]  (default 21120)
 """
@@ -24,6 +27,9 @@ APPROVED = {"tok-aprovado"}
 PEERS_SEEN = {}
 ATTEMPTS = []
 MAX_ATTEMPTS = 200
+OWNERS = {}  # id -> uuid (base64) dono do ID
+REGISTROS = []  # chamadas a /peers/registro, com a resposta dada
+REGISTRO = {"on": True}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -56,11 +62,22 @@ class Handler(BaseHTTPRequestHandler):
         elif url.path == "/_revoke" and token:
             APPROVED.discard(token)
             self._send(200, {"approved": sorted(APPROVED)})
+        elif url.path == "/_own":
+            pid = (qs.get("id") or [""])[0]
+            uuid = (qs.get("uuid") or [""])[0]
+            if pid and uuid:
+                OWNERS[pid] = uuid
+            self._send(200, {"owners": OWNERS})
+        elif url.path == "/_registro":
+            REGISTRO["on"] = (qs.get("on") or ["1"])[0] != "0"
+            self._send(200, REGISTRO)
         elif url.path == "/_state":
             self._send(200, {
                 "approved": sorted(APPROVED),
                 "peers_seen": PEERS_SEEN,
                 "attempts": ATTEMPTS,
+                "owners": OWNERS,
+                "registros": REGISTROS,
             })
         else:
             self._send(404)
@@ -87,6 +104,25 @@ class Handler(BaseHTTPRequestHandler):
             }
             print(f"  peer visto id={pid} ip={body.get('ip')} server={body.get('server')}")
             self._send(200)
+        elif url.path == "/peers/registro":
+            if not REGISTRO["on"]:
+                self._send(404)
+                return
+            pid = body.get("id", "")
+            uuid = body.get("uuid", "")
+            if not pid or not uuid or len(pid) > 30 or len(uuid) > 100:
+                self._send(400, {"erro": "id e uuid obrigatorios"})
+                return
+            dono = OWNERS.get(pid)
+            if dono is None:
+                OWNERS[pid] = uuid
+            if dono is None or dono == uuid:
+                resp = {"ok": True}
+            else:
+                resp = {"ok": False, "motivo": "uuid_mismatch"}
+            REGISTROS.append({**body, "resposta": resp})
+            print(f"  registro id={pid} uuid={uuid} ip={body.get('ip')} server={body.get('server')} -> {resp}")
+            self._send(200, resp)
         elif url.path == "/connections/attempt":
             if len(ATTEMPTS) >= MAX_ATTEMPTS:
                 del ATTEMPTS[0]

@@ -32,6 +32,15 @@ struct Config {
     /// OFFLINE, só quando a API não responde (CONTROL_API_JWT_KEYS). Vazio = sem
     /// validação offline: API fora aplica `fail_open` como sempre.
     jwt_keys: HashMap<String, jsonwebtoken::DecodingKey>,
+    /// CONTROL_API_REGISTER (default Y): a cada RegisterPk, confirma em
+    /// POST /peers/registro que o ID pertence a esta máquina (uuid). N = não consulta.
+    register: bool,
+    /// CONTROL_API_REGISTER_ENFORCE: Y = ID de outra máquina recebe UUID_MISMATCH
+    /// (o client sorteia outro ID); N (default) = só registra o conflito no log.
+    register_enforce: bool,
+    register_timeout_ms: u64,
+    /// TTL do cache (id -> uuid aceito) que evita repetir a consulta.
+    register_cache_secs: u64,
 }
 
 /// CONTROL_API_JWT_KEYS = "k1=<base64 SPKI ou PEM>;k2=..." (separador `;` ou `,`).
@@ -85,12 +94,20 @@ static CONFIG: Lazy<Config> = Lazy::new(|| {
             .unwrap_or(60),
         server_name: get_arg("control_api_server_name").trim().to_lowercase(),
         jwt_keys: parse_jwt_keys(&get_arg("control_api_jwt_keys")),
+        register: get_arg_or("control_api_register", "Y".to_owned()).to_uppercase() != "N",
+        register_enforce: get_arg("control_api_register_enforce").to_uppercase() == "Y",
+        register_timeout_ms: get_arg_or("control_api_register_timeout_ms", "1500".to_owned())
+            .parse()
+            .unwrap_or(1500),
+        register_cache_secs: get_arg_or("control_api_register_cache_secs", "300".to_owned())
+            .parse()
+            .unwrap_or(300),
     };
     if config.url.is_empty() {
         log::info!("BR_SUPORTE: CONTROL_API_URL vazio, feature DESLIGADA (comportamento vanilla)");
     } else {
         log::info!(
-            "BR_SUPORTE: LIGADO url={} server_name={:?} jwt_kids={:?} fail_open={} timeout_ms={} cache_secs={} seen_secs={} attempts={} attempt_dedupe_secs={} auth_bearer={}",
+            "BR_SUPORTE: LIGADO url={} server_name={:?} jwt_kids={:?} fail_open={} timeout_ms={} cache_secs={} seen_secs={} attempts={} attempt_dedupe_secs={} register={} register_enforce={} register_timeout_ms={} register_cache_secs={} auth_bearer={}",
             config.url,
             config.server_name,
             config.jwt_keys.keys().collect::<Vec<_>>(),
@@ -100,6 +117,10 @@ static CONFIG: Lazy<Config> = Lazy::new(|| {
             config.seen_secs,
             config.attempts,
             config.attempt_dedupe_secs,
+            config.register,
+            config.register_enforce,
+            config.register_timeout_ms,
+            config.register_cache_secs,
             !config.token.is_empty()
         );
     }
@@ -114,6 +135,21 @@ static HTTP: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
         Ok(client) => Some(client),
         Err(err) => {
             log::error!("BR_SUPORTE: failed to build http client: {}", err);
+            None
+        }
+    }
+});
+
+/// Cliente com timeout próprio (mais curto) para a consulta do dono do ID, que é
+/// aguardada no caminho do registro do peer.
+static HTTP_REGISTER: Lazy<Option<reqwest::Client>> = Lazy::new(|| {
+    match reqwest::Client::builder()
+        .timeout(Duration::from_millis(CONFIG.register_timeout_ms))
+        .build()
+    {
+        Ok(client) => Some(client),
+        Err(err) => {
+            log::error!("BR_SUPORTE: failed to build register http client: {}", err);
             None
         }
     }
@@ -222,6 +258,9 @@ static TOKEN_CACHE: Lazy<Mutex<HashMap<String, TokenEntry>>> = Lazy::new(Default
 static SEEN_SENT: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(Default::default);
 static ATTEMPT_SENT: Lazy<Mutex<HashMap<String, Instant>>> = Lazy::new(Default::default);
 static BLOCKS: Lazy<Mutex<Vec<BlockEntry>>> = Lazy::new(Default::default);
+/// id -> (uuid em base64 aceito pela API, quando)
+static REGISTER_CACHE: Lazy<Mutex<HashMap<String, (String, Instant)>>> =
+    Lazy::new(Default::default);
 
 #[inline]
 pub fn is_enabled() -> bool {
@@ -445,6 +484,110 @@ pub async fn report_seen(id: &str, ip: String) {
     });
 }
 
+#[inline]
+pub fn registration_enabled() -> bool {
+    is_enabled() && CONFIG.register
+}
+
+/// Confirma na API de controle que o ID pertence a esta máquina (`uuid`), para a
+/// unicidade do ID valer entre os hbbs redundantes e não só dentro de cada um.
+///
+/// Devolve `false` SÓ quando a API respondeu `{"ok":false}` e
+/// CONTROL_API_REGISTER_ENFORCE=Y. API fora, 404, 400, timeout ou corpo estranho
+/// = aceita (fail-open), com log. O uuid vai em base64, igual ao que o app manda
+/// à API no login, então a mesma máquina tem o mesmo valor nos dois caminhos.
+pub async fn check_registration(id: &str, uuid: &[u8], ip: &str) -> bool {
+    // "(:test_hbbs:)" is the internal self-test peer, not a real machine
+    if !registration_enabled() || id.is_empty() || uuid.is_empty() || id == "(:test_hbbs:)" {
+        return true;
+    }
+    let uuid_b64 = base64::encode(uuid);
+    let now = Instant::now();
+    {
+        let cache = REGISTER_CACHE.lock().await;
+        if let Some((cached, tm)) = cache.get(id) {
+            if *cached == uuid_b64
+                && now.duration_since(*tm).as_secs() < CONFIG.register_cache_secs
+            {
+                return true;
+            }
+        }
+    }
+    match call_registro(id, &uuid_b64, ip).await {
+        Ok(None) => {
+            let mut cache = REGISTER_CACHE.lock().await;
+            if cache.len() >= MAX_CACHE_ENTRIES && !cache.contains_key(id) {
+                let ttl = CONFIG.register_cache_secs;
+                cache.retain(|_, (_, tm)| now.duration_since(*tm).as_secs() < ttl);
+            }
+            cache.insert(id.to_owned(), (uuid_b64, now));
+            true
+        }
+        Ok(Some(motivo)) => {
+            log::warn!(
+                "BR_SUPORTE: peers/registro id={} uuid={} ip={} CONFLITO ({}) -> {}",
+                id,
+                uuid_b64,
+                ip,
+                motivo,
+                if CONFIG.register_enforce {
+                    "UUID_MISMATCH (client sorteia outro ID)"
+                } else {
+                    "aceito, SÓ LOG (CONTROL_API_REGISTER_ENFORCE=N)"
+                }
+            );
+            !CONFIG.register_enforce
+        }
+        Err(err) => {
+            log::warn!(
+                "BR_SUPORTE: peers/registro id={} FALHOU ({}) -> aceito (fail-open)",
+                id,
+                err
+            );
+            true
+        }
+    }
+}
+
+/// Ok(None) = aceito; Ok(Some(motivo)) = ID de outra máquina; Err = sem resposta útil.
+async fn call_registro(id: &str, uuid_b64: &str, ip: &str) -> Result<Option<String>, String> {
+    let client = HTTP_REGISTER
+        .as_ref()
+        .ok_or_else(|| "http client unavailable".to_owned())?;
+    let mut req = client
+        .post(format!("{}/peers/registro", CONFIG.url))
+        .json(&with_server(serde_json::json!({ "id": id, "uuid": uuid_b64, "ip": ip })));
+    if !CONFIG.token.is_empty() {
+        req = req.bearer_auth(&CONFIG.token);
+    }
+    let started = Instant::now();
+    let resp = req.send().await.map_err(|e| e.to_string())?;
+    let status = resp.status().as_u16();
+    log::info!(
+        "BR_SUPORTE: POST /peers/registro id={} -> HTTP {} em {}ms",
+        id,
+        status,
+        started.elapsed().as_millis()
+    );
+    if status != 200 {
+        return Err(format!("unexpected status {}", status));
+    }
+    let body = resp
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| format!("invalid json: {}", e))?;
+    match body.get("ok").and_then(|v| v.as_bool()) {
+        Some(true) => Ok(None),
+        Some(false) => Ok(Some(
+            body.get("motivo")
+                .and_then(|m| m.as_str())
+                .unwrap_or("?")
+                .to_owned(),
+        )),
+        None => Err("missing \"ok\" in body".to_owned()),
+    }
+}
+
 /// One connection attempt, as reported to the API audit endpoint.
 pub struct Attempt<'a> {
     /// "punch_hole" or "relay"
@@ -599,6 +742,14 @@ pub async fn diag() -> String {
         "attempts: {} attempt_dedupe_secs: {}",
         CONFIG.attempts, CONFIG.attempt_dedupe_secs
     );
+    let _ = writeln!(
+        res,
+        "register: {} register_enforce: {} register_timeout_ms: {} register_cache_secs: {}",
+        CONFIG.register,
+        CONFIG.register_enforce,
+        CONFIG.register_timeout_ms,
+        CONFIG.register_cache_secs
+    );
     {
         let cache = TOKEN_CACHE.lock().await;
         let _ = writeln!(res, "token cache: {} entries", cache.len());
@@ -621,6 +772,10 @@ pub async fn diag() -> String {
     {
         let attempts = ATTEMPT_SENT.lock().await;
         let _ = writeln!(res, "attempt dedupe: {} chaves", attempts.len());
+    }
+    {
+        let reg = REGISTER_CACHE.lock().await;
+        let _ = writeln!(res, "register cache: {} ids", reg.len());
     }
     {
         let blocks = BLOCKS.lock().await;
